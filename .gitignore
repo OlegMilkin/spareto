@@ -1,0 +1,8 @@
+node_modules/
+# IDE
+.idea/
+.vscode/
+output.json
+result.xlsx
+data.json
+log.txt
