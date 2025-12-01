@@ -1,29 +1,27 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
+<meta charset="UTF-8" />
 <title>Spareto Parser</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 body { background: #f4f6f8; font-family: Arial, sans-serif; padding: 30px; }
-h2 { margin-bottom: 20px; }
+.card { padding: 20px; margin-top: 20px; }
 #progressContainer { width: 100%; background-color: #ddd; border-radius: 8px; height: 30px; margin-top: 20px; overflow: hidden; box-shadow: inset 0 1px 3px rgba(0,0,0,.2);}
 #progressBar { height: 100%; width: 0%; text-align: center; line-height: 30px; color: white; font-weight: bold; transition: width 0.3s;}
 #progressBar.success { background-color: #4CAF50; }
 #progressBar.error { background-color: #dc3545; }
-#output { background: #fff; padding: 15px; border-radius: 8px; margin-top: 20px; max-height: 300px; overflow-y: auto; box-shadow: 0 2px 6px rgba(0,0,0,0.1); white-space: pre-wrap;}
-button { margin-left: 10px; }
-.card { padding: 20px; margin-top: 20px; }
+#output { background: #fff; padding: 15px; border-radius: 8px; margin-top: 20px; max-height: 260px; overflow-y: auto; box-shadow: 0 2px 6px rgba(0,0,0,0.1); white-space: pre-wrap;}
 </style>
 </head>
 <body>
-
 <div class="container">
   <div class="card">
     <h2 class="text-center">Парсер Spareto</h2>
-    <div class="d-flex align-items-center">
-      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" class="form-control">
+
+    <div class="d-flex gap-2">
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" class="form-control" />
       <button id="startBtn" disabled class="btn btn-primary">Начать парсинг</button>
     </div>
 
@@ -36,65 +34,43 @@ button { margin-left: 10px; }
 </div>
 
 <script>
-let jsonData = null;
 const fileInput = document.getElementById('fileInput');
 const startBtn = document.getElementById('startBtn');
 const output = document.getElementById('output');
 const progressContainer = document.getElementById('progressContainer');
 const progressBar = document.getElementById('progressBar');
 
-fileInput.addEventListener('change', handleFile);
+let jsonData = null;
 
-startBtn.addEventListener('click', async () => {
-  progressContainer.style.display = "block";
-  progressBar.style.width = "0%";
-  progressBar.textContent = "0%";
-  progressBar.className = "success";
-  output.textContent = "Парсинг начался...\n";
-
-  const evtSource = new EventSource('/progress');
-  evtSource.onmessage = function(e) {
+// connect EventSource for progress updates immediately
+const evtSource = new EventSource('/progress');
+evtSource.onmessage = function(e) {
+  // ignore initial comments
+  try {
     const data = JSON.parse(e.data);
-    const percent = Math.round((data.current / data.total) * 100);
-    progressBar.style.width = percent + "%";
-    progressBar.textContent = percent + "%";
-
-    if(data.errors > 0) progressBar.className = "error";
-    else progressBar.className = "success";
-
-    output.textContent = `Обработано: ${data.current} из ${data.total}\n` +
-                         `Успешно: ${data.success}\n` +
-                         `Ошибки: ${data.errors}`;
-
-    if(data.done) evtSource.close();
-  };
-
-  const response = await fetch('/parse', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(jsonData)
-  });
-
-  if (!response.ok) {
-    output.textContent = `Ошибка сервера: ${response.statusText}`;
-    return;
+    const percent = data.total ? Math.round((data.current / data.total) * 100) : 0;
+    progressBar.style.width = percent + '%';
+    progressBar.textContent = percent + '%';
+    progressBar.className = data.errors > 0 ? 'error' : 'success';
+    output.textContent = `Обработано: ${data.current} из ${data.total}\nУспешно: ${data.success}\nОшибки: ${data.errors}`;
+    if (data.done) {
+      progressBar.textContent = 'Готово!';
+    }
+  } catch (err) {
+    // ignore non-json messages
   }
+};
 
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'result.xlsx';
-  a.click();
-  URL.revokeObjectURL(url);
-  output.textContent += "\nПарсинг завершён. Файл скачан.";
-});
+fileInput.addEventListener('change', handleFile);
+startBtn.addEventListener('click', startParsing);
 
 function handleFile(e) {
   const file = e.target.files[0];
+  if (!file) return;
+  output.textContent = 'Читаю файл...';
   const reader = new FileReader();
-  reader.onload = function(event) {
-    const data = new Uint8Array(event.target.result);
+  reader.onload = function(evt) {
+    const data = new Uint8Array(evt.target.result);
     const workbook = XLSX.read(data, { type: 'array' });
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
@@ -102,17 +78,62 @@ function handleFile(e) {
 
     const goods = [];
     rows.forEach(r => {
-      if(r["Бренд"] && r["Код"]) {
-        const codes = r["Код"].toString().split("/").map(s=>s.trim()).filter(Boolean);
-        codes.forEach(c => goods.push({brand:r["Бренд"], code:c}));
-      }
+      // smart column detection (case-insensitive keys)
+      const keys = Object.keys(r);
+      const brandKey = keys.find(k => k && k.toString().trim().toLowerCase() === 'бренд');
+      const codeKey = keys.find(k => k && k.toString().trim().toLowerCase() === 'код');
+
+      if (!brandKey || !codeKey) return;
+
+      const brand = r[brandKey];
+      const codeRaw = r[codeKey];
+
+      if (!brand || !codeRaw) return;
+
+      const codes = codeRaw.toString().split('/').map(s => s.trim()).filter(Boolean);
+      codes.forEach(c => goods.push({ brand, code: c }));
     });
 
-    jsonData = {goods};
-    output.textContent = `Найдено ${goods.length} товаров`;
-    startBtn.disabled = goods.length === 0;
+    jsonData = { goods };
+    output.textContent = `Найдено ${jsonData.goods.length} товаров`;
+    startBtn.disabled = jsonData.goods.length === 0;
   };
   reader.readAsArrayBuffer(file);
+}
+
+async function startParsing() {
+  if (!jsonData) return;
+  progressContainer.style.display = 'block';
+  progressBar.style.width = '0%';
+  progressBar.textContent = '0%';
+  output.textContent = 'Отправляю на сервер...';
+
+  try {
+    const resp = await fetch('/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(jsonData)
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => null);
+      output.textContent = 'Ошибка сервера: ' + (err?.error || resp.statusText);
+      return;
+    }
+
+    output.textContent = 'Сервер завершил. Скачиваю файл...';
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'result.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+    output.textContent += '\nФайл скачан.';
+  } catch (e) {
+    output.textContent = 'Ошибка: ' + e.message;
+  }
 }
 </script>
 </body>

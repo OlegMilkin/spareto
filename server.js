@@ -1,72 +1,76 @@
 import express from "express";
-import fileUpload from "express-fileupload";
-import path from "path";
+import bodyParser from "body-parser";
 import fs from "fs/promises";
-import xlsx from "xlsx";
-import { processFile } from "./parser.js";
+import path from "path";
+import { parseAllGoodsWithProgress } from "./parser.js";
 
 const app = express();
 const PORT = 3000;
 
-const UPLOADS_DIR = "./uploads";
-await fs.mkdir(UPLOADS_DIR, { recursive: true });
+app.use(bodyParser.json({ limit: "200mb" }));
+app.use(express.static(path.join(".", "public")));
 
-app.use(fileUpload());
-app.use(express.static("public"));
+let clients = [];
 
-// ------------------------------------------------------------
-// Загрузка файла и парсинг Excel → JSON
-// ------------------------------------------------------------
-app.post("/upload", async (req, res) => {
-  if (!req.files || !req.files.file)
-    return res.status(400).send("Файл не загружен");
+// SSE endpoint for progress
+app.get("/progress", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
 
-  const file = req.files.file;
-  const filePath = path.join(UPLOADS_DIR, file.name);
-  await file.mv(filePath);
+  // send a comment to keep connection alive initially
+  res.write(": connected\n\n");
 
-  const workbook = xlsx.readFile(filePath);
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = xlsx.utils.sheet_to_json(sheet);
-
-  const goods = rows.flatMap((row) => {
-    const brand = row["Бренд"];
-    const codeStr = row["Код"];
-
-    if (!brand || !codeStr) return [];
-
-    return codeStr
-      .split("/")
-      .map((code) => code.trim())
-      .filter((c) => c.length > 0)
-      .map((code) => ({ brand, code }));
+  clients.push(res);
+  req.on("close", () => {
+    clients = clients.filter((c) => c !== res);
   });
-
-  const jsonPath = path.join(UPLOADS_DIR, file.name + ".json");
-  await fs.writeFile(jsonPath, JSON.stringify({ goods }, null, 2));
-
-  res.json({ jsonPath });
 });
 
-// ------------------------------------------------------------
-// Запуск парсинга
-// ------------------------------------------------------------
-app.post("/start", express.json(), async (req, res) => {
-  const { jsonPath } = req.body;
+// helper to broadcast progress to all connected clients
+function sendProgressToClients(payload) {
+  const msg = `data: ${JSON.stringify(payload)}\n\n`;
+  clients.forEach((res) => {
+    try { res.write(msg); } catch (e) { /* ignore */ }
+  });
+}
 
-  const resultFile = await processFile(jsonPath, "result");
+// main parse endpoint — receives JSON { goods: [...] }
+app.post("/parse", async (req, res) => {
+  try {
+    const jsonData = req.body;
 
-  res.json({ download: "/download?file=result.xlsx" });
+    // save for parser (optional)
+    await fs.writeFile("data.json", JSON.stringify(jsonData, null, 2), "utf8");
+
+    // call parser with progress callback
+    await parseAllGoodsWithProgress((progressObj) => {
+      // progressObj: { current, total, success, errors, done }
+      sendProgressToClients(progressObj);
+    });
+
+    // read generated excel and return as file download (binary)
+    const excelPath = path.join(".", "result.xlsx");
+    const buffer = await fs.readFile(excelPath);
+
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="result.xlsx"'
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    // send buffer as response
+    res.send(buffer);
+  } catch (err) {
+    console.error("Error /parse:", err);
+    res.status(500).send({ error: err.message });
+  }
 });
 
-// ------------------------------------------------------------
-// Выдача итогового файла
-// ------------------------------------------------------------
-app.get("/download", async (req, res) => {
-  const file = req.query.file;
-  res.download(path.join("./outputs", file));
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
 });
-
-app.listen(PORT, () =>
-  console.log(`Server running at http://localhost:${PORT}`)
-);
